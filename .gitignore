@@ -12,6 +12,9 @@
 
 # Package Files #
 *.jar
+
+# 一键打包产物
+dist/
 *.war
 *.nar
 *.ear

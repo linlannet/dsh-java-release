@@ -20,10 +20,14 @@
 #
 # 仓库根目录保留 dsh-java-app.jar、apps/ 与 plugins/（后两者会原样拷入 dist/）。
 #
+# 说明：
+#   release 内不执行任何 Maven 构建，直接从 ../dsh-java/dsh-java-app/target
+#   拷贝对应版本的 exec fat jar。
+#
 # 用法：
-#   ./package.sh            仅打包（要求各模块已执行 mvn package）
-#   ./package.sh --build    先执行 mvn package -DskipTests 再打包
-#   ./package.sh -h         查看帮助
+#   ./package.sh                   拷贝默认版本（0.2.2）
+#   ./package.sh --version 0.2.2    指定 release 版本
+#   ./package.sh -h                查看帮助
 #
 set -euo pipefail
 
@@ -33,38 +37,38 @@ PLUGINS_DIR="${PLUGINS_DIR:-${SCRIPT_DIR}/../dsh-java-plugins}"
 DIST_DIR="${SCRIPT_DIR}/dist"
 PLUGINS="mysql oceanbase dameng mall"
 
+RELEASE_VERSION="${RELEASE_VERSION:-0.2.2}"
+
 usage() {
   cat <<'EOF'
-Usage: ./package.sh [--build]
+Usage: ./package.sh [--version <x.y.z>]
 
 Options:
-  --build     先在两个源仓库执行 mvn package -DskipTests，再收集产物
+  --version   指定 release 版本（默认 0.2.2）
   -h, --help  显示本帮助
 
+说明：release 内不执行 Maven 构建，直接从 ../dsh-java/dsh-java-app/target
+      拷贝对应版本的 exec fat jar。
 产物目录：dist/（dsh-java-app.jar + apps/ + plugins/ + start.sh）
 EOF
 }
 
-BUILD=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --build) BUILD=true ;;
+    --version)
+      RELEASE_VERSION="${2:-}"
+      if [[ -z "${RELEASE_VERSION}" ]]; then
+        echo "--version 需要版本号，例如：--version 0.2.2" >&2
+        exit 1
+      fi
+      shift 2
+      ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
-  shift
 done
 
-if [[ "${BUILD}" == true ]]; then
-  if ! command -v mvn >/dev/null 2>&1; then
-    echo "未找到 mvn，请先安装 Maven 3.9+" >&2
-    exit 1
-  fi
-  echo "构建 dsh-java ..."
-  (cd "${DSH_JAVA_DIR}" && mvn package -DskipTests -q)
-  echo "构建 dsh-java-plugins ..."
-  (cd "${PLUGINS_DIR}" && mvn package -DskipTests -q)
-fi
+echo "Release 版本：${RELEASE_VERSION}（不执行 Maven 构建，直接拷贝 target 构件）"
 
 # 在指定目录中按 find 条件挑选 jar（取版本号最大的一个）
 find_jar() {
@@ -87,9 +91,22 @@ copy_jar() {
 echo "收集构件到 ${SCRIPT_DIR} ..."
 mkdir -p "${SCRIPT_DIR}/apps" "${SCRIPT_DIR}/plugins"
 
-# 1) dsh-java 主程序：exec fat jar 放到与 apps/ 同级的目录，改名为 dsh-java-app.jar
-APP_JAR="$(find_jar "${DSH_JAVA_DIR}/dsh-java-app/target" -name 'dsh-java-app-*-exec.jar')"
-copy_jar "${APP_JAR}" "${SCRIPT_DIR}/dsh-java-app.jar" "dsh-java-app (exec)"
+# 1) dsh-java 主程序：直接拷贝 target 下指定版本的 exec fat jar（release 内不打包）
+APP_JAR="$(find_jar "${DSH_JAVA_DIR}/dsh-java-app/target" -name "dsh-java-app-${RELEASE_VERSION}-exec.jar")"
+if [[ -z "${APP_JAR}" ]]; then
+  echo "未找到 dsh-java-app-${RELEASE_VERSION}-exec.jar，回退到最新 exec jar" >&2
+  APP_JAR="$(find_jar "${DSH_JAVA_DIR}/dsh-java-app/target" -name 'dsh-java-app-*-exec.jar')"
+fi
+copy_jar "${APP_JAR}" "${SCRIPT_DIR}/dsh-java-app.jar" "dsh-java-app ${RELEASE_VERSION} (exec)"
+if [[ -n "${APP_JAR}" && -f "${APP_JAR}" && -f "${SCRIPT_DIR}/dsh-java-app.jar" ]]; then
+  SRC_HASH="$(shasum -a 256 "${APP_JAR}" | awk '{print $1}')"
+  DST_HASH="$(shasum -a 256 "${SCRIPT_DIR}/dsh-java-app.jar" | awk '{print $1}')"
+  if [[ "${SRC_HASH}" != "${DST_HASH}" ]]; then
+    echo "dsh-java-app.jar 拷贝后哈希不一致" >&2
+    exit 1
+  fi
+  echo "    SHA-256 ${SRC_HASH}"
+fi
 
 # 2) 四个插件：app 的 exec fat jar 放到 apps/，plugin 瘦 jar 放到 plugins/
 for name in ${PLUGINS}; do
@@ -103,6 +120,18 @@ for name in ${PLUGINS}; do
   copy_jar "${PLUGIN_SRC}" "${SCRIPT_DIR}/plugins/dsh-java-${name}-plugin.jar" "dsh-java-${name}-plugin"
 done
 
+# 2.1) sample-tools-plugin：dsh-java 内置示例插件（plugins/sample-tools-plugin）
+rm -f "${SCRIPT_DIR}"/plugins/sample-tools-plugin-*.jar
+SAMPLE_JAR="$(find_jar "${DSH_JAVA_DIR}/plugins/sample-tools-plugin/target" \
+  -name "sample-tools-plugin-${RELEASE_VERSION}.jar" \
+  ! -name '*-sources.jar' ! -name '*-javadoc.jar')"
+if [[ -z "${SAMPLE_JAR}" ]]; then
+  SAMPLE_JAR="$(find_jar "${DSH_JAVA_DIR}/plugins/sample-tools-plugin/target" \
+    -name 'sample-tools-plugin-*.jar' \
+    ! -name '*-sources.jar' ! -name '*-javadoc.jar')"
+fi
+copy_jar "${SAMPLE_JAR}" "${SCRIPT_DIR}/plugins/sample-tools-plugin.jar" "sample-tools-plugin"
+
 # 3) 早期版本把 app 与 plugin 混放在 resources/，这里清理掉旧目录
 if [[ -d "${SCRIPT_DIR}/resources" ]]; then
   rm -rf "${SCRIPT_DIR}/resources"
@@ -111,7 +140,7 @@ fi
 
 if [[ ${#MISSING[@]} -gt 0 ]]; then
   echo "" >&2
-  echo "以下构件未找到，请先在对应仓库执行 mvn package -DskipTests（或使用 ./package.sh --build）：" >&2
+  echo "以下构件未找到，请先在对应仓库执行 mvn package -DskipTests：" >&2
   printf '  - %s\n' "${MISSING[@]}" >&2
   exit 1
 fi
